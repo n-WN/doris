@@ -1172,20 +1172,47 @@ public:
         std::vector<std::string_view> views;
 
         if (is_column<ColumnArray>(argument_columns[1].get())) {
-            // Determine if the nested type of the array is String
-            const auto& array_column = reinterpret_cast<const ColumnArray&>(*argument_columns[1]);
-            if (!array_column.get_data().is_column_string()) {
-                return Status::NotSupported(
-                        fmt::format("unsupported nested array of type {} for function {}",
-                                    is_column_nullable(array_column.get_data())
-                                            ? array_column.get_data().get_name()
-                                            : array_column.get_data().get_name(),
-                                    get_name()));
+            // Check if we have multiple arrays (all arguments from index 1 onwards should be arrays)
+            bool all_arrays = true;
+            for (size_t i = 1; i < argument_size; ++i) {
+                if (!is_column<ColumnArray>(argument_columns[i].get())) {
+                    all_arrays = false;
+                    break;
+                }
             }
-            // Concat string in array
-            _execute_array(input_rows_count, array_column, buffer, views, offsets_list, chars_list,
-                           null_list, res_data, res_offset);
-
+            
+            if (all_arrays && argument_size > 2) {
+                // Multiple arrays case
+                std::vector<const ColumnArray*> array_columns;
+                for (size_t i = 1; i < argument_size; ++i) {
+                    const auto& array_column = reinterpret_cast<const ColumnArray&>(*argument_columns[i]);
+                    if (!array_column.get_data().is_column_string()) {
+                        return Status::NotSupported(
+                                fmt::format("unsupported nested array of type {} for function {}",
+                                            is_column_nullable(array_column.get_data())
+                                                    ? array_column.get_data().get_name()
+                                                    : array_column.get_data().get_name(),
+                                            get_name()));
+                    }
+                    array_columns.push_back(&array_column);
+                }
+                _execute_multi_array(input_rows_count, array_columns, buffer, views, offsets_list, chars_list,
+                                   null_list, res_data, res_offset);
+            } else {
+                // Single array case
+                const auto& array_column = reinterpret_cast<const ColumnArray&>(*argument_columns[1]);
+                if (!array_column.get_data().is_column_string()) {
+                    return Status::NotSupported(
+                            fmt::format("unsupported nested array of type {} for function {}",
+                                        is_column_nullable(array_column.get_data())
+                                                ? array_column.get_data().get_name()
+                                                : array_column.get_data().get_name(),
+                                        get_name()));
+                }
+                // Concat string in array
+                _execute_array(input_rows_count, array_column, buffer, views, offsets_list, chars_list,
+                               null_list, res_data, res_offset);
+            }
         } else {
             // Concat string
             _execute_string(input_rows_count, argument_size, buffer, views, offsets_list,
@@ -1304,6 +1331,100 @@ private:
                 }
             }
             fmt::format_to(buffer, "{}", fmt::join(views, sep));
+            StringOP::push_value_string(std::string_view(buffer.data(), buffer.size()), i, res_data,
+                                        res_offset);
+        }
+    }
+
+    void _execute_multi_array(const size_t& input_rows_count, 
+                              const std::vector<const ColumnArray*>& array_columns,
+                              fmt::memory_buffer& buffer, std::vector<std::string_view>& views,
+                              const std::vector<const Offsets*>& offsets_list,
+                              const std::vector<const Chars*>& chars_list,
+                              const std::vector<const ColumnUInt8::Container*>& null_list,
+                              Chars& res_data, Offsets& res_offset) const {
+        size_t num_arrays = array_columns.size();
+        
+        // Prepare array data structures for each array
+        std::vector<const UInt8*> array_nested_null_maps(num_arrays, nullptr);
+        std::vector<ColumnPtr> array_nested_columns(num_arrays);
+        std::vector<const ColumnString*> string_columns(num_arrays);
+        std::vector<const Chars*> string_src_chars(num_arrays);
+        std::vector<const Offsets*> src_string_offsets(num_arrays);
+        std::vector<const Offsets*> src_array_offsets(num_arrays);
+        std::vector<size_t> current_src_array_offsets(num_arrays, 0);
+
+        for (size_t arr_idx = 0; arr_idx < num_arrays; ++arr_idx) {
+            const auto* array_column = array_columns[arr_idx];
+            
+            if (is_column_nullable(array_column->get_data())) {
+                const auto& array_nested_null_column =
+                        reinterpret_cast<const ColumnNullable&>(array_column->get_data());
+                array_nested_null_maps[arr_idx] =
+                        array_nested_null_column.get_null_map_column().get_data().data();
+                array_nested_columns[arr_idx] = array_nested_null_column.get_nested_column_ptr();
+            } else {
+                array_nested_columns[arr_idx] = array_column->get_data_ptr();
+            }
+
+            string_columns[arr_idx] = &reinterpret_cast<const ColumnString&>(*array_nested_columns[arr_idx]);
+            string_src_chars[arr_idx] = &string_columns[arr_idx]->get_chars();
+            src_string_offsets[arr_idx] = &string_columns[arr_idx]->get_offsets();
+            src_array_offsets[arr_idx] = &array_column->get_offsets();
+        }
+
+        // Process each row
+        for (size_t i = 0; i < input_rows_count; ++i) {
+            auto& sep_offsets = *offsets_list[0];
+            auto& sep_chars = *chars_list[0];
+            auto& sep_nullmap = *null_list[0];
+
+            if (sep_nullmap[i]) {
+                res_offset[i] = res_data.size();
+                // Update offsets for all arrays
+                for (size_t arr_idx = 0; arr_idx < num_arrays; ++arr_idx) {
+                    current_src_array_offsets[arr_idx] += 
+                        (*src_array_offsets[arr_idx])[i] - (*src_array_offsets[arr_idx])[i - 1];
+                }
+                continue;
+            }
+
+            int sep_size = sep_offsets[i] - sep_offsets[i - 1];
+            const char* sep_data = reinterpret_cast<const char*>(&sep_chars[sep_offsets[i - 1]]);
+            std::string_view sep(sep_data, sep_size);
+            
+            buffer.clear();
+            views.clear();
+
+            // Collect all non-null elements from all arrays for this row
+            for (size_t arr_idx = 0; arr_idx < num_arrays; ++arr_idx) {
+                size_t array_len = (*src_array_offsets[arr_idx])[i] - (*src_array_offsets[arr_idx])[i - 1];
+                
+                for (size_t elem_idx = 0; elem_idx < array_len; ++elem_idx) {
+                    size_t global_string_idx = current_src_array_offsets[arr_idx] + elem_idx;
+                    const auto current_src_string_offset =
+                            global_string_idx ? (*src_string_offsets[arr_idx])[global_string_idx - 1] : 0;
+                    size_t bytes_to_copy =
+                            (*src_string_offsets[arr_idx])[global_string_idx] - current_src_string_offset;
+                    const char* ptr =
+                            reinterpret_cast<const char*>(&(*string_src_chars[arr_idx])[current_src_string_offset]);
+
+                    if (array_nested_null_maps[arr_idx] == nullptr ||
+                        !array_nested_null_maps[arr_idx][global_string_idx]) {
+                        views.emplace_back(ptr, bytes_to_copy);
+                    }
+                }
+            }
+
+            // Join all collected elements with the separator
+            fmt::format_to(buffer, "{}", fmt::join(views, sep));
+
+            // Update offsets for all arrays
+            for (size_t arr_idx = 0; arr_idx < num_arrays; ++arr_idx) {
+                size_t array_len = (*src_array_offsets[arr_idx])[i] - (*src_array_offsets[arr_idx])[i - 1];
+                current_src_array_offsets[arr_idx] += array_len;
+            }
+
             StringOP::push_value_string(std::string_view(buffer.data(), buffer.size()), i, res_data,
                                         res_offset);
         }

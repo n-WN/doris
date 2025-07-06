@@ -1472,6 +1472,52 @@ TEST(function_string_test, function_concat_ws_test) {
     };
 }
 
+TEST(function_string_test, function_concat_ws_multi_array_test) {
+    std::string func_name = "concat_ws";
+    
+    // Test multiple arrays
+    {
+        InputTypeSet input_types = {PrimitiveType::TYPE_VARCHAR, PrimitiveType::TYPE_ARRAY,
+                                    PrimitiveType::TYPE_ARRAY};
+
+        TestArray vec1 = {std::string("a"), std::string("b")};
+        TestArray vec2 = {std::string("1"), std::string("2")};
+        TestArray vec3 = {std::string("x")};
+        TestArray vec4 = {std::string("y"), std::string("z"), std::string("w")};
+        TestArray empty_array = {};
+        
+        DataSet data_set = {
+            // Test basic multiple arrays
+            {{std::string(","), vec1, vec2}, std::string("a,b,1,2")},
+            // Test arrays of different lengths
+            {{std::string("-"), vec3, vec4}, std::string("x-y-z-w")},
+            // Test with empty array
+            {{std::string("|"), vec1, empty_array}, std::string("a|b")},
+            {{std::string("|"), empty_array, vec2}, std::string("1|2")},
+            // Test with empty separator
+            {{std::string(""), vec1, vec2}, std::string("ab12")},
+        };
+
+        check_function_all_arg_comb<DataTypeString, true>(func_name, input_types, data_set);
+    };
+    
+    // Test with three arrays
+    {
+        InputTypeSet input_types = {PrimitiveType::TYPE_VARCHAR, PrimitiveType::TYPE_ARRAY,
+                                    PrimitiveType::TYPE_ARRAY, PrimitiveType::TYPE_ARRAY};
+
+        TestArray vec1 = {std::string("a"), std::string("b")};
+        TestArray vec2 = {std::string("1"), std::string("2")};
+        TestArray vec3 = {std::string("x"), std::string("y")};
+        
+        DataSet data_set = {
+            {{std::string(","), vec1, vec2, vec3}, std::string("a,b,1,2,x,y")},
+        };
+
+        check_function_all_arg_comb<DataTypeString, true>(func_name, input_types, data_set);
+    };
+}
+
 TEST(function_string_test, function_null_or_empty_test) {
     std::string func_name = "null_or_empty";
 
